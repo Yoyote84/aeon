@@ -1,0 +1,574 @@
+/**
+ * Aeon skill executor — shared core for loading the skill catalog and running a
+ * skill through the configured harness via harness-adapter's `run-harness`,
+ * identical to how GitHub Actions invokes it.
+ *
+ * Extracted from the MCP server so the load → prompt → spawn → parse logic lives
+ * in one testable place. Any future transport (HTTP, a queue worker, another
+ * protocol bridge) can import this instead of re-implementing skill execution.
+ */
+
+import { readFileSync, existsSync } from "fs";
+import { join } from "path";
+import { spawn, spawnSync } from "child_process";
+
+export interface Skill {
+  slug: string;
+  name: string;
+  description: string;
+  category: string;
+  /** From aeon.yml, not the catalog: a cron string, "workflow_dispatch", or unset. */
+  schedule?: string;
+  var: string;
+}
+
+interface SkillsManifest {
+  version: string;
+  repo: string;
+  skills: Skill[];
+}
+
+/** Drop a `#` comment, but only outside double quotes (a var like "fix #12" survives). */
+function stripComment(line: string): string {
+  let quoted = false;
+  for (let i = 0; i < line.length; i++) {
+    const c = line[i];
+    if (c === '"') quoted = !quoted;
+    if (c === "#" && !quoted && (i === 0 || /[ \t]/.test(line[i - 1]))) return line.slice(0, i);
+  }
+  return line;
+}
+
+/**
+ * A skill's own entry in aeon.yml's skills map, comments stripped, or undefined.
+ * A port of scripts/skill_entry.sh (the reader the workflow and resolve-harness.sh
+ * use), so it handles BOTH entry shapes:
+ *   single-line   my-skill: { enabled: true, model: "x" }
+ *   block         my-skill:
+ *                   { enabled: true,
+ *                     model: "x" }
+ * Capture runs from the header to the line that closes the flow map, and stops
+ * early at the next entry or top-level key. The first header wins (the skills map
+ * sits above chains:, which also indents its keys by two).
+ */
+function skillConfigLine(cfg: string, slug: string): string | undefined {
+  const header = `  ${slug}:`;
+  const out: string[] = [];
+  let found = false;
+  for (const raw of cfg.split("\n")) {
+    if (!found) {
+      if (!raw.startsWith(header)) continue;
+      found = true;
+    } else if (/^ {2}[^ #]/.test(raw) || /^[^ #\t]/.test(raw)) {
+      break; // next entry / next top-level key
+    }
+    const line = stripComment(raw);
+    out.push(line);
+    if (line.includes("}")) break;
+  }
+  return found ? out.join("\n") : undefined;
+}
+
+function readConfig(repoRoot: string): string {
+  try {
+    return readFileSync(join(repoRoot, "aeon.yml"), "utf-8");
+  } catch {
+    return "";
+  }
+}
+
+/**
+ * Load the skill catalog from <repoRoot>/catalog/skills.json. Returns [] if missing.
+ *
+ * The catalog deliberately carries no schedules (bin/generate-skills-json), so each
+ * skill's `schedule:` is read from aeon.yml, the source of truth. A skill with no
+ * entry there keeps `schedule` unset.
+ */
+export function loadSkills(repoRoot: string, logPrefix = "[aeon]"): Skill[] {
+  const manifestPath = join(repoRoot, "catalog", "skills.json");
+  if (!existsSync(manifestPath)) {
+    process.stderr.write(`${logPrefix} catalog/skills.json not found at ${manifestPath}\n`);
+    return [];
+  }
+  const manifest = JSON.parse(readFileSync(manifestPath, "utf-8")) as SkillsManifest;
+  const cfg = readConfig(repoRoot);
+  return (manifest.skills ?? []).map(skill => {
+    const schedule = skillConfigLine(cfg, skill.slug)?.match(/schedule:\s*"([^"]*)"/)?.[1];
+    return schedule ? { ...skill, schedule } : skill;
+  });
+}
+
+/**
+ * Build the prompt the CLI receives — mirrors the GitHub Actions invocation so a
+ * local run is identical to a scheduled one.
+ */
+export function buildSkillPrompt(slug: string, varValue: string): string {
+  const today = new Date().toISOString().split("T")[0];
+  let prompt = `Today is ${today}. Read and execute the skill defined in skills/${slug}/SKILL.md`;
+  const value = sanitizeVar(varValue);
+  if (value) {
+    prompt += `\n\nUse this variable (override the default in the skill file):\nvar=${value}`;
+  }
+  return prompt;
+}
+
+/**
+ * The var is caller-supplied text that lands inside the prompt. Fold line breaks
+ * and other control characters into spaces so it stays one `var=` line and
+ * cannot start a new paragraph of instructions after it. Invisible format
+ * characters (zero-width space, BOM, bidi marks) are dropped, and surrounding
+ * whitespace is trimmed, so the value the model reads is the value the
+ * capability check sees: runSkillInner cleans the var once with this and passes
+ * that one value to resolveMode, the prompt and the log.
+ */
+export function sanitizeVar(varValue: string): string {
+  return varValue
+    .replace(/[\p{Cc}\p{Zl}\p{Zp}]+/gu, " ")
+    .replace(/\p{Cf}+/gu, "")
+    .trim();
+}
+
+/** Every harness harness-adapter's run-harness can dispatch to. */
+export const HARNESSES = ["claude", "grok", "codex", "pi", "vibe", "kimi", "fx", "cursor", "hermes"] as const;
+export type Harness = (typeof HARNESSES)[number];
+const isHarness = (v: string): v is Harness => (HARNESSES as readonly string[]).includes(v);
+
+/**
+ * Which agent harness runs the skill. Mirrors scripts/resolve-harness.sh's
+ * precedence so a local MCP run matches a scheduled one: the AEON_HARNESS env
+ * wins, else the skill's own `harness:` override in aeon.yml, else the repo's
+ * global `harness:`, else `claude`. Any unknown value → `claude`.
+ *
+ * `slug` is optional so non-skill callers get the repo-global answer, matching
+ * resolve-harness.sh's optional skill-name argument.
+ */
+export function resolveHarness(repoRoot: string, slug?: string): Harness {
+  let picked = (process.env.AEON_HARNESS || "").trim().toLowerCase();
+  if (!picked) {
+    const cfg = readConfig(repoRoot); // "" when there is no aeon.yml -> default
+    // Per-skill override, read from the whole entry (single-line or block),
+    // like resolve-harness.sh does via scripts/skill_entry.sh.
+    if (slug) {
+      picked =
+        skillConfigLine(cfg, slug)
+          ?.match(/harness:\s*"([^"]*)"/)?.[1]
+          ?.toLowerCase() ?? "";
+    }
+    if (!picked) picked = cfg.match(/^harness:\s*["']?([A-Za-z]+)/m)?.[1].toLowerCase() ?? "";
+  }
+  // Allowlist LAST, as resolve-harness.sh does: a value that is set but
+  // unrecognized falls back to claude rather than to the next level down. A
+  // skill pinned to a harness that was removed must not silently inherit the
+  // repo default.
+  //
+  // One deliberate divergence: resolve-harness.sh strips no quotes from the
+  // GLOBAL key, so a hand-written `harness: "codex"` reaches its allowlist as
+  // `"codex"` and is rewritten to claude. That is a bug in that script, not a
+  // contract, so this reads the YAML correctly instead of reproducing it.
+  return isHarness(picked) ? picked : "claude";
+}
+
+/**
+ * AEON_MODEL, the local stand-in for the workflow_dispatch `model` input (as
+ * AEON_HARNESS is for `harness`). "(config default)" is that input's placeholder
+ * value, so it counts as unset here too.
+ */
+function inputModel(): string {
+  const v = (process.env.AEON_MODEL || "").trim();
+  return v === "(config default)" ? "" : v;
+}
+
+/**
+ * aeon's own model id for the run, the same 3-tier precedence as the workflow's
+ * Run step (.github/workflows/aeon.yml, the INPUT_MODEL / SKILL_MODEL /
+ * CONFIG_MODEL block): AEON_MODEL, else the skill's `model: "..."` in its aeon.yml
+ * entry, else the repo's global `model:`, else claude-sonnet-5-5. Like
+ * resolveHarness, the global key is read with its quotes and trailing comment
+ * dropped (the workflow's grep keeps both).
+ */
+export function resolveModel(repoRoot: string, slug?: string): string {
+  const input = inputModel();
+  if (input) return input;
+  const cfg = readConfig(repoRoot);
+  const skillModel = slug ? (skillConfigLine(cfg, slug)?.match(/model:\s*"([^"]*)"/)?.[1] ?? "") : "";
+  if (skillModel) return skillModel;
+  return cfg.match(/^model:\s*["']?([^\s"'#]+)/m)?.[1] ?? "claude-sonnet-5-5";
+}
+
+/**
+ * The `--model` args for run-harness, or [] to let the harness pick its default.
+ * Mirrors what the workflow passes per harness, because aeon's model ids are
+ * claude or grok ids that mean nothing to the other CLIs:
+ *   claude  always `--model <resolveModel()>`.
+ *   grok    a claude-*, `default` or empty pick becomes grok-4.7; only a grok-*
+ *           id is passed.
+ *   others  MODEL_ARG from scripts/resolve-harness.sh (the same script the
+ *           workflow's "Resolve harness" step runs), which maps the pick to the
+ *           harness's own id or leaves it empty, based on which auth keys are set.
+ */
+function resolveModelArgs(repoRoot: string, slug: string, harness: Harness, logPrefix: string): string[] {
+  if (harness === "claude") return ["--model", resolveModel(repoRoot, slug)];
+  if (harness === "grok") {
+    let model = resolveModel(repoRoot, slug);
+    if (model === "default" || model.startsWith("claude-")) model = "grok-4.7";
+    return model.startsWith("grok-") ? ["--model", model] : [];
+  }
+  const script = join(repoRoot, "scripts", "resolve-harness.sh");
+  if (!existsSync(script)) return [];
+  const res = spawnSync("bash", [script, slug], {
+    cwd: repoRoot,
+    encoding: "utf-8",
+    env: { ...process.env, INPUT_HARNESS: harness, INPUT_MODEL: inputModel() },
+  });
+  if (res.status !== 0) {
+    process.stderr.write(`${logPrefix} resolve-harness.sh failed; using the ${harness} default model\n`);
+    return [];
+  }
+  const modelArg = (res.stdout || "").match(/^MODEL_ARG=(.*)$/m)?.[1]?.trim() ?? "";
+  return modelArg ? ["--model", modelArg] : [];
+}
+
+/**
+ * The skill's capability tier and toolset, from the same scripts/skill_mode.sh
+ * that aeon.yml calls — NOT re-derived here. `--mode read-only` is what makes
+ * run-harness apply its OS sandbox (harness-adapter/run-harness gates
+ * sandbox_prefix on it), so getting this wrong silently drops the write boundary
+ * for the skills that declare `mode: read-only`.
+ *
+ * `varValue` is passed through so skill_mode.sh's shared selector check (e.g.
+ * vuln-scanner's Riva shadow/compare evaluation) applies on this dispatch path
+ * too, not only aeon.yml's. That check used to live only in a script aeon.yml
+ * sourced, so this path silently ran shadow evaluations at full write access
+ * with every ambient credential attached. Pass the sanitizeVar() value, the
+ * same one the prompt gets: the selector match is exact, so a raw value with
+ * padding or a line break would miss it while the model still reads shadow.
+ *
+ * Returns null when the tier cannot be determined. Callers must fail rather than
+ * assume `write`: guessing the permissive tier is exactly the mistake this
+ * function exists to prevent.
+ */
+function resolveMode(
+  repoRoot: string,
+  slug: string,
+  varValue: string,
+): { mode: string; allowedTools: string; runNotes: string; isShadow: boolean } | null {
+  const script = join(repoRoot, "scripts", "skill_mode.sh");
+  if (!existsSync(script)) return null;
+  const run = (...args: string[]) => spawnSync("bash", [script, ...args], { cwd: repoRoot, encoding: "utf-8" });
+
+  const shadowRes = run("is-shadow", slug, varValue);
+  if (shadowRes.status !== 0) return null;
+  const isShadow = (shadowRes.stdout || "").trim() === "true";
+
+  const modeRes = run("mode", slug, varValue);
+  if (modeRes.status !== 0) return null;
+  const mode = (modeRes.stdout || "").trim();
+  if (mode !== "read-only" && mode !== "write") return null;
+
+  const toolsRes = run("allowed-tools", mode);
+  if (toolsRes.status !== 0) return null;
+  const allowedTools = (toolsRes.stdout || "").trim();
+  if (!allowedTools) return null;
+
+  // Standing tier notes (notify via stdin, no shell file writes), the same
+  // `run-notes <mode>` aeon.yml appends to the system prompt. Empty is allowed.
+  const notesRes = run("run-notes", mode);
+  if (notesRes.status !== 0) return null;
+  const runNotes = (notesRes.stdout || "").trim();
+
+  return { mode, allowedTools, runNotes, isShadow };
+}
+
+/**
+ * Shadow/compare evaluation runs are research-only: the harness must not carry
+ * disclosure-capable credentials. Mirrors the unset list in aeon.yml's shadow
+ * branch exactly, so both dispatch surfaces withhold the same set.
+ */
+const SHADOW_STRIPPED_ENV_VARS = [
+  "ALL_SECRETS",
+  "GH_GLOBAL",
+  "GH_TOKEN",
+  "GITHUB_TOKEN",
+  "RESEND_API_KEY",
+  "RESEND_FROM",
+  "RESEND_REPLY_TO",
+  "XAI_API_KEY",
+];
+
+function shadowSafeEnv(env: NodeJS.ProcessEnv): NodeJS.ProcessEnv {
+  const filtered = { ...env };
+  for (const key of SHADOW_STRIPPED_ENV_VARS) delete filtered[key];
+  return filtered;
+}
+
+// Single-flight queue. spawnSync used to serialize runs by freezing the event
+// loop; moving to async spawn removes that accidental lock, so runs must be
+// serialized explicitly. Every run shares `cwd: repoRoot`, so two concurrent
+// write-mode skills would race the same working tree: `.git/index.lock`
+// collisions on commit, plus interleaved writes to memory/, output/ and
+// cron-state.json. This keeps one skill running at a time; a second tools/call
+// waits its turn instead of corrupting the tree.
+let runQueue: Promise<unknown> = Promise.resolve();
+function enqueue<T>(task: () => Promise<T>): Promise<T> {
+  const result = runQueue.then(task, task);
+  // Keep the chain alive regardless of this run's outcome so one failure does
+  // not wedge every later run.
+  runQueue = result.then(
+    () => undefined,
+    () => undefined,
+  );
+  return result;
+}
+
+/**
+ * Per-run budget in seconds, passed to run-harness as --timeout. Matches the
+ * `--timeout 1800` aeon.yml passes on a scheduled run.
+ */
+export const RUN_TIMEOUT_SECONDS = 1800;
+
+/**
+ * How long the Node timer gives run-harness before killing it. run-harness
+ * wraps the CLI in `timeout -k $RH_KILL_AFTER <budget>` (default 30), which
+ * TERMs it at the budget and KILLs it that many seconds later; the timer fires
+ * after both, with a 30 second margin, so
+ * `timeout` ends the run wherever it is installed and this timer only matters
+ * on a host without it.
+ */
+const KILL_AFTER_SECONDS = Number(process.env.RH_KILL_AFTER) || 30;
+export const HARNESS_TIMEOUT_MS = (RUN_TIMEOUT_SECONDS + KILL_AFTER_SECONDS + 30) * 1000;
+
+export interface HarnessResult {
+  status: number | null;
+  stdout: string;
+  stderr: string;
+  error?: NodeJS.ErrnoException;
+}
+
+/**
+ * Async replacement for spawnSync with the same result shape
+ * (status/stdout/stderr/error) so the parsing below is unchanged, but it awaits
+ * `close` instead of blocking the Node event loop for the whole run.
+ * Enforces the same timeout and combined output cap, surfacing each as `error`
+ * the way spawnSync did (ETIMEDOUT / ENOBUFS).
+ *
+ * The harness runs in its own process group, and a kill takes the whole group:
+ * killing only bash leaves a child it started running, holding the stdout pipe
+ * open, so `close` waits on it. Where timeout(1) or gtimeout(1) is installed,
+ * run-harness starts the agent CLI under it, which moves the CLI into a group
+ * of its own that this kill does not reach: there `timeout` enforces the
+ * budget (see HARNESS_TIMEOUT_MS), and
+ * the output cap stops bash while the CLI runs until `timeout` ends it. Without
+ * timeout(1) the CLI stays in this group and the kill here ends it.
+ */
+export function spawnHarness(
+  args: string[],
+  opts: {
+    input: string;
+    cwd: string;
+    env: NodeJS.ProcessEnv;
+    timeout: number;
+    maxBuffer: number;
+  },
+): Promise<HarnessResult> {
+  return new Promise(resolve => {
+    const child = spawn("bash", args, { cwd: opts.cwd, env: opts.env, detached: true });
+    let stdout = "";
+    let stderr = "";
+    let settled = false;
+    let killReason: "timeout" | "buffer" | null = null;
+
+    const killGroup = () => {
+      try {
+        if (child.pid !== undefined) process.kill(-child.pid, "SIGKILL");
+      } catch {
+        // The group is already gone; kill the child itself in case it is not.
+        child.kill("SIGKILL");
+      }
+    };
+
+    const timer = setTimeout(() => {
+      killReason = "timeout";
+      killGroup();
+    }, opts.timeout);
+
+    const capture = (chunk: Buffer, sink: "out" | "err") => {
+      if (sink === "out") stdout += chunk.toString("utf-8");
+      else stderr += chunk.toString("utf-8");
+      if (stdout.length + stderr.length > opts.maxBuffer) {
+        killReason = "buffer";
+        killGroup();
+      }
+    };
+    child.stdout.on("data", (c: Buffer) => capture(c, "out"));
+    child.stderr.on("data", (c: Buffer) => capture(c, "err"));
+
+    const finish = (r: HarnessResult) => {
+      if (settled) return;
+      settled = true;
+      clearTimeout(timer);
+      resolve(r);
+    };
+
+    child.on("error", err => finish({ status: null, stdout, stderr, error: err as NodeJS.ErrnoException }));
+    child.on("close", code => {
+      let error: NodeJS.ErrnoException | undefined;
+      if (killReason === "timeout") {
+        error = Object.assign(new Error(`run-harness timed out after ${opts.timeout} ms`), { code: "ETIMEDOUT" });
+      } else if (killReason === "buffer") {
+        error = Object.assign(new Error(`run-harness output exceeded ${opts.maxBuffer} bytes`), { code: "ENOBUFS" });
+      }
+      finish({ status: code, stdout, stderr, error });
+    });
+
+    // Feed the prompt on stdin, matching spawnSync's `input`. Ignore EPIPE if the
+    // child exits before the write finishes.
+    child.stdin.on("error", () => {});
+    child.stdin.write(opts.input);
+    child.stdin.end();
+  });
+}
+
+/** A skill run's text plus whether it ran to completion, so callers can flag failures. */
+export interface SkillRunResult {
+  ok: boolean;
+  text: string;
+}
+
+/**
+ * Run a skill and return its text output. Serialized through `enqueue` (one skill
+ * at a time, since they share the repo working tree) and dispatched through
+ * harness-adapter's `run-harness`, which emits one `{ result, usage }` envelope
+ * for every harness, so parsing is shared. Failure modes (missing skill, missing
+ * CLI, non-zero exit, empty output) come back as `{ ok: false, text }` with a
+ * human-readable message rather than thrown, and the MCP server marks those
+ * results `isError`, so callers can surface them without special-casing.
+ *
+ * Async so a running skill no longer freezes the whole stdio MCP server: the old
+ * spawnSync parked the Node event loop for the whole run on every call, blocking
+ * every other request (tools/list, pings, a second tool call). This awaits the
+ * child instead.
+ */
+export function runSkill(
+  repoRoot: string,
+  slug: string,
+  varValue: string,
+  logPrefix = "[aeon]",
+): Promise<SkillRunResult> {
+  return enqueue(() => runSkillInner(repoRoot, slug, varValue, logPrefix));
+}
+
+async function runSkillInner(
+  repoRoot: string,
+  slug: string,
+  varValue: string,
+  logPrefix: string,
+): Promise<SkillRunResult> {
+  const skillFile = join(repoRoot, "skills", slug, "SKILL.md");
+  if (!existsSync(skillFile)) {
+    return fail(
+      [
+        `Error: skill '${slug}' not found.`,
+        `Expected SKILL.md at: ${skillFile}`,
+        `Make sure you're running from inside an Aeon repo clone.`,
+      ].join("\n"),
+    );
+  }
+
+  // Clean the var once and use that one value everywhere below. The capability
+  // check (skill_mode.sh's exact shadow/compare match) used to get the raw value
+  // while the prompt got the cleaned one, so " shadow" or "shadow\n" resolved to
+  // write mode with every credential attached while the model read var=shadow.
+  const cleanVar = sanitizeVar(varValue);
+
+  const capability = resolveMode(repoRoot, slug, cleanVar);
+  if (!capability) {
+    return fail(
+      [
+        `Error: could not resolve the capability tier for '${slug}'.`,
+        `scripts/skill_mode.sh must be present and runnable from: ${repoRoot}`,
+        `Refusing to run rather than defaulting to write mode.`,
+      ].join("\n"),
+    );
+  }
+
+  const prompt = buildSkillPrompt(slug, cleanVar);
+  const harness = resolveHarness(repoRoot, slug);
+  const modelArgs = resolveModelArgs(repoRoot, slug, harness, logPrefix);
+  const modelLabel = modelArgs[1] ?? `${harness} default`;
+  process.stderr.write(
+    `${logPrefix} Running skill: ${slug}${cleanVar ? ` (var=${cleanVar})` : ""} [harness: ${harness}, model: ${modelLabel}, mode: ${capability.mode}]\n`,
+  );
+
+  // Every harness goes through harness-adapter's run-harness — the same dispatcher
+  // aeon.yml uses — so a local MCP run behaves like a scheduled one and adapter-level
+  // fixes (grok's MCP folder --trust, codex's TOML config translation, kimi's
+  // config overlay) apply here too. This path used to call `claude -p -` and
+  // scripts/run-grok.sh directly, which is how it missed those fixes.
+  //
+  // --mode/--allowed-tools come from scripts/skill_mode.sh, matching aeon.yml's
+  // RH_ARGS. They used to be hardcoded to write, so the twelve skills declaring
+  // `mode: read-only` ran unsandboxed with the full write toolset on this path -
+  // the same two-path drift the run-path consolidation removed, one layer up.
+  // --model likewise follows the workflow (resolveModelArgs); without it a local
+  // run silently used the CLI's own default instead of the skill's pinned model.
+  const runHarness = join(repoRoot, "harness-adapter", "run-harness");
+  const args = [
+    runHarness,
+    harness,
+    ...modelArgs,
+    "--mode",
+    capability.mode,
+    "--allowed-tools",
+    capability.allowedTools,
+    "--timeout",
+    String(RUN_TIMEOUT_SECONDS),
+  ];
+  if (capability.runNotes) {
+    args.push("--append-system-prompt", capability.runNotes);
+  }
+  // Shadow runs get no MCP servers, matching aeon.yml (`SHADOW_MODE != 1` gates
+  // its MCP block): an MCP server is a credentialed side channel that
+  // shadowSafeEnv's stripped env would not cover.
+  if (!capability.isShadow && existsSync(join(repoRoot, ".mcp.json"))) {
+    args.push("--mcp-config", join(repoRoot, ".mcp.json"));
+  }
+
+  const result = await spawnHarness(args, {
+    input: prompt,
+    cwd: repoRoot,
+    env: capability.isShadow ? shadowSafeEnv(process.env) : process.env,
+    timeout: HARNESS_TIMEOUT_MS,
+    maxBuffer: 10 * 1024 * 1024, // 10 MB
+  });
+
+  if (result.error) {
+    const enoent = result.error.code === "ENOENT";
+    const msg = enoent
+      ? `'bash' or harness-adapter/run-harness not found — run from inside an Aeon repo clone.`
+      : `Failed to spawn run-harness: ${result.error.message}`;
+    return fail(`Error: ${msg}`);
+  }
+
+  if (result.status !== 0) {
+    const output = (result.stderr || result.stdout || "").trim();
+    return fail(`Skill '${slug}' failed (exit ${result.status}):\n${output}`);
+  }
+
+  const stdout = (result.stdout || "").trim();
+  if (!stdout) {
+    return fail(`Skill '${slug}' produced no output.`);
+  }
+
+  // run-harness normalizes every harness to { result: "..." }, so this parse is
+  // harness-agnostic.
+  try {
+    const parsed = JSON.parse(stdout) as { result?: string };
+    return { ok: true, text: parsed.result ?? stdout };
+  } catch {
+    return { ok: true, text: stdout };
+  }
+}
+
+function fail(text: string): SkillRunResult {
+  return { ok: false, text };
+}

@@ -1,0 +1,93 @@
+name: CI Gate
+on:
+  pull_request:
+permissions:
+  actions: read
+  checks: read
+  contents: read
+concurrency:
+  group: ci-gate-${{ github.event.pull_request.number }}
+  cancel-in-progress: true
+jobs:
+  # The job id `gate` is the required status check on main - do not rename it.
+  gate:
+    # Pure polling, no build: GitHub's runner on purpose, not AEON_RUNNER (free
+    # on public repos, starts faster, and a paid runner would bill the whole wait).
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    steps:
+      - name: Require all CI checks to pass
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REPO: ${{ github.repository }}
+          SHA: ${{ github.event.pull_request.head.sha }}
+          SELF_RUN_ID: ${{ github.run_id }}
+        run: |
+          set -euo pipefail
+          # Poll until every sibling workflow run AND every check run on the head
+          # SHA has completed, then judge. Workflow runs are created when the
+          # pull_request event is processed, before their jobs register check
+          # runs, so waiting on them covers slow path-filtered siblings without a
+          # fixed grace sleep. All sibling runs are created together with this
+          # one, so once a poll has seen any of them in progress, the first
+          # all-done poll is final. Only an all-done snapshot on the very first
+          # polls (siblings maybe not created yet) must hold for two polls in a
+          # row before judging, in case a sibling registers late.
+          #
+          # Polls every 5s for the first 3 minutes so the gate ends within ~5s
+          # of the last sibling, then every 15s to stay well inside the
+          # GITHUB_TOKEN rate limit when a sibling runs long.
+          #
+          # Workflow runs are deduped to the newest run per workflow file (the
+          # check-runs endpoint already returns only the latest run per name), so
+          # an older cancelled run on the same SHA cannot fail the gate.
+          workflow_runs() {
+            gh api "repos/$REPO/actions/runs?head_sha=$SHA&per_page=100" --paginate \
+              -q ".workflow_runs[] | select(.id != $SELF_RUN_ID and .path != \".github/workflows/ci-gate.yml\") | [.path, (.id | tostring), .name, .status, (.conclusion // \"\")] | @tsv" \
+              | sort -t "$(printf '\t')" -k1,1 -k2,2nr \
+              | awk -F'\t' 'NF>0 && !seen[$1]++ {print $3 "\t" $4 "\t" $5}'
+          }
+          start=$(date +%s)
+          deadline=$(( start + 1500 ))
+          stable=0
+          seen_pending=0
+          last_pending=""
+          while :; do
+            wf=$(workflow_runs)
+            runs=$(gh api "repos/$REPO/commits/$SHA/check-runs?per_page=100" --paginate \
+              -q '.check_runs[] | select(.name != "gate") | [.name, .status, (.conclusion // "")] | @tsv')
+            pending=$(
+              printf '%s\n' "$wf" | awk -F'\t' 'NF>0 && $2 ~ /^(queued|in_progress|waiting|requested|pending)$/ {print "workflow: " $0}'
+              printf '%s\n' "$runs" | awk -F'\t' 'NF>0 && $2!="completed" {print "check:    " $0}'
+            )
+            if [ -z "$pending" ]; then
+              stable=$(( stable + 1 ))
+              { [ "$seen_pending" -eq 1 ] || [ "$stable" -ge 2 ]; } && break
+            else
+              stable=0
+              seen_pending=1
+              if [ "$pending" != "$last_pending" ]; then
+                echo "Waiting on runs still in progress:"
+                printf '%s\n' "$pending"
+                last_pending=$pending
+              fi
+            fi
+            now=$(date +%s)
+            if [ "$now" -ge "$deadline" ]; then
+              echo "Timed out waiting for CI checks to complete."
+              exit 1
+            fi
+            if [ $(( now - start )) -lt 180 ]; then sleep 5; else sleep 15; fi
+          done
+          # A workflow that fails before any job starts (e.g. invalid YAML) has no
+          # check runs, so judge the workflow runs' conclusions as well.
+          failed=$(
+            printf '%s\n' "$wf" | awk -F'\t' 'NF>0 && $3!="success" && $3!="skipped" && $3!="neutral" {print "workflow: " $0}'
+            printf '%s\n' "$runs" | awk -F'\t' 'NF>0 && $3!="success" && $3!="skipped" && $3!="neutral" {print "check:    " $0}'
+          )
+          if [ -n "$failed" ]; then
+            echo "These CI checks did not pass:"
+            printf '%s\n' "$failed"
+            exit 1
+          fi
+          echo "All CI checks are green (or skipped). Gate passes."

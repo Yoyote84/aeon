@@ -1,0 +1,84 @@
+# Aeon operator console (plugin)
+
+The operator-facing skill for [Aeon](https://github.com/aeonfun/aeon), an autonomous
+agent framework that runs your own skills on a schedule in GitHub Actions. This
+plugin ships that skill so you can drive an Aeon instance straight from your
+coding agent: get started from scratch, turn skills on or off, schedule or
+reschedule what runs, edit what a skill does, debug a skill that will not fire,
+set the `STRATEGY.md` north star and soul voice, and mine past coding-agent chats
+into new scheduled skills.
+
+It is a self-contained copy of the setup skill only - installing it never pulls in
+the unattended framework catalog. Full setup guide:
+[`docs/aeon-setup.md`](https://github.com/aeonfun/aeon/blob/main/docs/aeon-setup.md).
+
+## Install
+
+**Claude Code**
+
+```
+/plugin marketplace add aeonfun/aeon
+/plugin install aeon@aeon
+```
+
+**Codex**
+
+```
+codex plugin marketplace add aeonfun/aeon
+codex plugin add aeon@aeon
+```
+
+Then type `/aeon` (or mention Aeon / `aeon.yml` / "schedule a skill") and point it
+at your instance repo when it asks.
+
+## Connect your agent
+
+The plugin also connects to your agent through Aeon Connect's hosted MCP server,
+`https://www.aeon.fun/connect/mcp`. Sign in with GitHub and pick your agent repo;
+from then on you can ask, from any chat:
+
+- "What skills does my Aeon agent have, and which are on?" (`list_skills`)
+- "Run the digest skill now and tell me when it is done" (`run_skill`, `get_run`)
+- "Show me what my last digest found" (`read_output`)
+- "Did anything fail today? Why?" (`list_runs`, `get_run`)
+- "Turn on the digest every morning at 8" (`update_skill`, commits `aeon.yml` after you confirm)
+- "What does my agent still need to be fully set up?" (`setup_status`)
+- "What has my agent written down about this week?" (`search_memory`, `read_memory`)
+- "Add this goal to my strategy" or "Make my agent sound more casual"
+  (`read_strategy` / `update_strategy`, `read_soul` / `update_soul`, after you confirm)
+- "What skill packs can I add?" (`list_packs`; `install_pack` opens a pull request after you confirm)
+- "Which Aeon agents can I use here? Switch to my other one" (`list_instances`, `switch_instance`)
+- "Which model does my agent run on? Switch it to another one"
+  (`read_instance_settings` / `update_instance_settings`, after you confirm)
+- "Open my Aeon dashboard" (`open_runs`)
+- "That run failed for no reason, report it" (`send_feedback`)
+
+In ChatGPT there is more: the settings page has one switch per skill plus the agent
+harness, `@` in the composer finds skills by name, and running a skill shows a live
+view of its runs.
+
+The connection reaches only the repo you pick, plus your other Aeon repos if you allow
+switching when you connect. It never reads or changes your secrets: `setup_status` can
+name missing keys, never show their values. After install, the `get-started` skill
+checks the connection, says what setup is missing, and runs a first skill with you.
+
+## What it needs
+
+- The [GitHub CLI](https://cli.github.com/) (`gh`) authenticated - the skill drives
+  everything through `gh`, the same way the dashboard does.
+- An Aeon instance repo to operate on. No instance yet? Create one in the browser
+  with [Aeon Connect](https://www.aeon.fun/connect), or from the
+  [template](https://github.com/aeonfun/aeon) with `./aeon init`.
+
+Everything the skill does is plain `gh` + `./aeon` commands, so nothing about it is
+tied to one coding agent beyond where the skill file is loaded from.
+
+## Privacy and support
+
+- Privacy Policy: https://www.aeon.fun/privacy
+- Support: email aaron@aeon.fun, or open an issue at https://github.com/aeonfun/aeon/issues
+- Security: see [`SECURITY.md`](./SECURITY.md)
+
+## License
+
+MIT - see [`LICENSE`](./LICENSE).

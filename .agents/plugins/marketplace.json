@@ -1,0 +1,26 @@
+{
+  "name": "aeon",
+  "description": "Aeon plugins - install the operator console for setting up and running an Aeon agent instance.",
+  "owner": {
+    "name": "Aeon Inc",
+    "url": "https://github.com/aeonfun"
+  },
+  "interface": {
+    "displayName": "Aeon"
+  },
+  "plugins": [
+    {
+      "name": "aeon",
+      "source": {
+        "source": "local",
+        "path": "./plugin"
+      },
+      "policy": {
+        "installation": "AVAILABLE",
+        "authentication": "ON_USE"
+      },
+      "category": "Productivity",
+      "description": "Run your Aeon agent from your coding agent: connect to it, run and schedule skills, and set it up with the operator console."
+    }
+  ]
+}

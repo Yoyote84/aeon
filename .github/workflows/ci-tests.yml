@@ -1,0 +1,109 @@
+name: ci-tests
+
+# Runs the committed script test suites on every PR that touches scripts/, bin/,
+# harness-adapter/ (run-harness + lib/sandbox.sh included), skills/, aeon.yml, the
+# dashboard model lists (apps/dashboard/lib/constants.ts), or the
+# aeon/chain-runner workflows the tests assert against.
+# These are the local tests authored alongside the hardening "easy wins" ported from
+# aeon-dev (notify formatting, capability modes, config validation) — same gate shape
+# as the other ci-*.yml. Keeps the extracted ./notify and the helper scripts honest.
+
+on:
+  pull_request:
+    paths:
+      - 'scripts/**'
+      - 'bin/**'
+      - 'aeon.yml'
+      - '.github/workflows/aeon.yml'
+      - '.github/workflows/messages.yml'
+      - '.github/workflows/scheduler.yml'
+      - 'harness-adapter/**'
+      - '.github/workflows/chain-runner.yml'
+      - 'skills/**'
+      - 'apps/dashboard/lib/constants.ts'
+      - 'apps/dashboard/lib/harness-auth.ts'
+      - 'apps/dashboard/lib/gateway-registry.ts'
+      - '.github/workflows/ci-tests.yml'
+      - '.github/actions/install-bubblewrap/**'
+  push:
+    branches: [main]
+    paths:
+      - 'scripts/**'
+      - 'bin/**'
+      - 'aeon.yml'
+      - '.github/workflows/aeon.yml'
+      - '.github/workflows/messages.yml'
+      - '.github/workflows/scheduler.yml'
+      - 'harness-adapter/**'
+      - '.github/workflows/chain-runner.yml'
+      - 'skills/**'
+      - 'apps/dashboard/lib/constants.ts'
+      - 'apps/dashboard/lib/harness-auth.ts'
+      - 'apps/dashboard/lib/gateway-registry.ts'
+      - '.github/workflows/ci-tests.yml'
+      - '.github/actions/install-bubblewrap/**'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+# Cancel a superseded in-progress run when a newer commit is pushed to the same PR
+# (reclaims runner-minutes on stacked PR pushes). Never cancels push/main/tag runs.
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+jobs:
+  test:
+    # Blacksmith, not GitHub: measured when the suites ran as serial steps, where
+    # single-core speed decided. Median job 51s vs 64.5s on GitHub's public 4 vCPU
+    # runner (queue 7s vs 2s), live bwrap checks pass; Blacksmith 4 vCPU was no
+    # faster (50s).
+    # Bench: runs 38823788873 + 38825096928. The label comes from the
+    # AEON_RUNNER repo variable like every other job; unset = ubuntu-24.04.
+    runs-on: ${{ vars.AEON_RUNNER || 'ubuntu-24.04' }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+      - name: Install deps
+        run: pip install pyyaml==6.0.2
+      # The run-harness sandbox-gate test has a LIVE half that only runs where bwrap
+      # can create a user namespace. Same setup as aeon.yml's "Install bubblewrap
+      # (read-only sandbox)" step: install it, lift Ubuntu 24.04's AppArmor userns
+      # restriction, then fail HERE if bwrap still cannot run, so the live checks
+      # never silently skip on CI (the test step also requires them, below).
+      # This job is the one that saves the .deb on a cache miss; ci-harness-cli's
+      # smoke jobs only restore it.
+      - name: Install bubblewrap (live read-only sandbox test)
+        timeout-minutes: 5
+        uses: ./.github/actions/install-bubblewrap
+      # The suites live in scripts/tests/ci-lanes.txt, split over 10 lanes that run
+      # at once (GitHub parallel steps, at most 10 concurrent; more parallel steps
+      # cost ~0.2s each at Blacksmith job teardown). Each lane runs every suite in
+      # it, one ::group:: per suite, then fails naming the suites that failed.
+      # Serial: median 49s; 10 lanes: 21-22s (aeon#1237).
+      - parallel:
+          - name: tests lane 1
+            run: bash scripts/tests/run_ci_lane.sh 1
+          - name: tests lane 2
+            run: bash scripts/tests/run_ci_lane.sh 2
+          - name: tests lane 3
+            run: bash scripts/tests/run_ci_lane.sh 3
+          - name: tests lane 4
+            run: bash scripts/tests/run_ci_lane.sh 4
+          - name: tests lane 5
+            run: bash scripts/tests/run_ci_lane.sh 5
+          - name: tests lane 6
+            run: bash scripts/tests/run_ci_lane.sh 6
+          - name: tests lane 7
+            run: bash scripts/tests/run_ci_lane.sh 7
+          - name: tests lane 8
+            run: bash scripts/tests/run_ci_lane.sh 8
+          - name: tests lane 9
+            run: bash scripts/tests/run_ci_lane.sh 9
+          - name: tests lane 10
+            run: bash scripts/tests/run_ci_lane.sh 10
+      # Runs even when a lane failed: a scripts/tests/test_* file in no lane (or a
+      # lane with no step above) fails here, so a new test is never skipped.
+      - name: every test file is in a lane
+        if: ${{ !cancelled() }}
+        run: bash scripts/tests/run_ci_lane.sh --check

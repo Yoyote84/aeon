@@ -221,8 +221,7 @@ chains:
     max_dispatches: 5
     steps:
       - { skill: feature, var: "$chain_target" }
-      - { skill: pr-review, var: "$feature_pr", consume: [feature] }
-
+      - { skill: pr-review, var: "$feature_pr", consume: [ feature ] }
   # morning-digest:
   #   schedule: "0 7 * * *"
   #   on_error: fail-fast
@@ -230,18 +229,18 @@ chains:
   #     - { parallel: [token-movers, github-trending] }
   #     - { skill: digest, consume: [token-movers, github-trending] }
 
-# Default model for all skills. Override per-run via workflow_dispatch.
-# Options: claude-sonnet-5-5, claude-opus-5-5, claude-haiku-5-5
-# (older claude-sonnet-5 / claude-opus-4-8 still accepted)
-# (Grok harness model: grok-4.7, the flagship reasoning model and grok's current
-#  default, run with --no-subagents in CI; grok-4.6 is also offered, and an existing
-#  grok-4.5 pin is still accepted on an X-account login. grok-4.7 is the gateway
-#  default too. The older coding ids (grok-build-0.1, grok-composer-2.5-fast,
-#  grok-4.3) are gateway-only, reachable via XAI_API_KEY + the GROK_MODEL var.)
-# The non-claude harnesses use their OWN model ids (codex openai/*, kimi moonshotai/*,
-# vibe mistralai/*, pi deepseek/*) — surfaced in the dashboard picker per harness; see
-# docs/harnesses.md. The value below only applies to the claude/grok harnesses.
-model: claude-sonnet-5-5
+  # Default model for all skills. Override per-run via workflow_dispatch.
+  # Options: claude-sonnet-5-5, claude-opus-5-5, claude-haiku-5-5
+  # (older claude-sonnet-5 / claude-opus-4-8 still accepted)
+  # (Grok harness model: grok-4.7, the flagship reasoning model and grok's current
+  #  default, run with --no-subagents in CI; grok-4.6 is also offered, and an existing
+  #  grok-4.5 pin is still accepted on an X-account login. grok-4.7 is the gateway
+  #  default too. The older coding ids (grok-build-0.1, grok-composer-2.5-fast,
+  #  grok-4.3) are gateway-only, reachable via XAI_API_KEY + the GROK_MODEL var.)
+  # The non-claude harnesses use their OWN model ids (codex openai/*, kimi moonshotai/*,
+  # vibe mistralai/*, pi deepseek/*) — surfaced in the dashboard picker per harness; see
+  # docs/harnesses.md. The value below only applies to the claude/grok harnesses.
+model: openai/gpt-6-luna
 
 # Agent harness — which coding-agent CLI runs your skills.
 #   claude (default)  — Claude Code (`claude -p`); uses the AI Gateway below.
@@ -260,7 +259,7 @@ model: claude-sonnet-5-5
 # Override per-skill with `harness: "<name>"` in the skill entry, or per-run via
 # the workflow_dispatch `harness` input. Default stays claude — everything
 # already configured keeps working unchanged.
-harness: claude
+harness: codex
 
 # AI Gateway — route Claude Code requests through an LLM provider.
 #

@@ -3414,6 +3414,26 @@
       ],
       "contentHash": "sha256-b95b9c6d984ff6eb0404559092b2d20d089986784255df96b86fefaa9f87c8a0",
       "discoveredFrom": "skills/github-filing-registry/SKILL.md"
+    },
+    {
+      "id": "7759ff0481853b14",
+      "tool": "aeon",
+      "scope": "project:.",
+      "type": "skill",
+      "name": "flightgear-android-ci-fixer",
+      "source": {
+        "kind": "local",
+        "ref": "skills/flightgear-android-ci-fixer"
+      },
+      "capabilities": {},
+      "files": [
+        {
+          "path": "SKILL.md",
+          "hash": "df4aa2cd4e57685da61f429ed5d9a40e1f1c0e750410290573d9ea62f0fd7f11"
+        }
+      ],
+      "contentHash": "sha256-c23fc361d8b47bfa685d93d94dfed11db774754c91fff8aa1b97727456b7b84e",
+      "discoveredFrom": "skills/flightgear-android-ci-fixer/SKILL.md"
     }
   ]
 }

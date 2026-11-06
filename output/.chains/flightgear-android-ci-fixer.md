@@ -1,3 +1,3 @@
-⚠️ FlightGear Android CI fixer
+Stopped before making changes. The skill requires the working repository and branch to be `Yoyote84/FlightGear-Android` on `native-flightgear-port`, but this workspace is `Yoyote84/aeon` on `main` and has existing local changes (`CLAUDE.md` deleted; `notify`, `notify-jsonrender`, and `secretcurl` untracked).
 
-Pushed commit 3b8519c to PR #1, adding FlightProperties implementation to the Android native target. GitHub Actions has not surfaced a run for the pushed commit; CI status remains unverified.
+Read-only GitHub checks confirmed PR #1 is open on `native-flightgear-port`, PR #2 is closed, and the latest listed Android ARM64 run failed on November 5 at commit `2a89922`. I did not inspect logs or attempt a fix because the skill says to stop when the repository or branch does not match. No files or remote state were changed.

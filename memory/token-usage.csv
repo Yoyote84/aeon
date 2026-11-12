@@ -20,3 +20,4 @@ date,skill,model,input_tokens,output_tokens,cache_read,cache_creation
 2026-11-10,heartbeat,gpt-6-luna,32985,3637,371712,0
 2026-11-11,flightgear-android-ci-fixer,gpt-6-luna,21631,1077,78848,0
 2026-11-11,heartbeat,gpt-6-luna,38868,2512,319872,0
+2026-11-12,flightgear-android-ci-fixer,gpt-6-luna,10713,965,88448,0

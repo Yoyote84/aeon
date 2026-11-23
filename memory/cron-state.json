@@ -1,15 +1,15 @@
 {
   "flightgear-android-ci-fixer": {
-    "last_status": "dispatched",
+    "last_status": "failed",
     "last_success": "2026-11-12T09:57:55Z",
-    "total_runs": 25,
+    "total_runs": 26,
     "total_successes": 12,
-    "total_failures": 13,
-    "consecutive_failures": 12,
-    "success_rate": 0.48,
+    "total_failures": 14,
+    "consecutive_failures": 13,
+    "success_rate": 0.46,
     "last_quality_score": 3,
     "last_dispatch": "2026-11-23T10:54:38Z",
-    "last_failed": "2026-11-22T08:09:39Z",
+    "last_failed": "2026-11-23T10:55:17Z",
     "last_error": "ting discovery unauthorized (401))\"} {\"type\":\"error\",\"message\":\"Reconnecting... 3/5 (workspace routing discovery unauthorized (401))\"} {\"type\":\"error\",\"message\":\"Reconnecting... 4/5 (workspace routing"
   },
   "heartbeat": {
